@@ -248,23 +248,41 @@ with st.sidebar:
     if api_key_input:
         os.environ["NEBIUS_API_KEY"] = api_key_input
 
+    models_available = [
+        "nvidia/Nemotron-3_5-Lightning",
+        "nvidia/nemotron-3-super-120b-a12b",
+        "nvidia/Nemotron-3-Ultra-550b-a55b",
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+        "nvidia/Llama-3_1-Nemotron-70B-Instruct-HF",
+    ]
+    cur_model = os.getenv("NEBIUS_MODEL", "nvidia/Nemotron-3_5-Lightning")
+    cur_model_idx = models_available.index(cur_model) if cur_model in models_available else 0
+
     nebius_model_choice = st.selectbox(
         "Nemotron Model:",
-        [
-            "nvidia/Llama-3_1-Nemotron-70B-Instruct-HF",
-            "nvidia/nemotron-4-340b-instruct"
-        ],
-        index=0
+        models_available,
+        index=cur_model_idx,
+        help="Select NVIDIA Nemotron model on Nebius Token Factory."
     )
     os.environ["NEBIUS_MODEL"] = nebius_model_choice
 
     active_key = os.getenv("NEBIUS_API_KEY", "")
     if active_key and active_key != "your_nebius_api_key_here":
         st.markdown("<span class='badge-normal'>🟢 Nebius API Configured</span>", unsafe_allow_html=True)
-        st.caption(f"Target: `{nebius_model_choice}`")
+        st.caption(f"Model: `{nebius_model_choice}`")
     else:
         st.markdown("<span class='badge-moderate'>🟠 Fallback Mode Active</span>", unsafe_allow_html=True)
         st.caption("No valid Nebius key detected. Local physics fallback active.")
+
+    if st.button("🧪 Test Nemotron Connection", use_container_width=True, help="Sends a test diagnostic query to verify the Nebius Token Factory API."):
+        with st.spinner("Pinging NVIDIA Nemotron via Nebius Token Factory..."):
+            test_res = drillguard.test_nemotron_connection()
+            if test_res["success"]:
+                st.success(f"🟢 Connected to Nemotron! ({test_res['latency_sec']}s)")
+                with st.expander("Diagnostic Response", expanded=True):
+                    st.markdown(test_res["response"])
+            else:
+                st.error(f"🔴 Connection Failed:\n{test_res['error']}")
 
     st.markdown("---")
     st.caption("🔒 **Physical AI Safety Notice**:")
@@ -631,34 +649,90 @@ if top_devs:
 # ---------------------------------------------------------
 st.markdown("---")
 st.markdown("### 🧠 NVIDIA Nemotron Physical AI Diagnostic Reasoning")
-st.caption("Integrated via Nebius Token Factory API (Studio) • Automated Local Fallback Protected")
+st.caption("Integrated via Nebius Token Factory API • Structured JSON Protocol • Automated Fallback Protected")
 
 # Execute Diagnosis
 diag_engine = drillguard.NemotronDiagnosticEngine()
-with st.spinner("Generating deep physical diagnostic reasoning..."):
+with st.spinner("Streaming structured physical reasoning from NVIDIA Nemotron..."):
     diag_response = diag_engine.diagnose(derived_feats, ml_results, scenario_meta)
 
-# Render Diagnosis Card
+structured = diag_response.get("structured", {})
+severity_val = structured.get("severity", scenario_meta["severity"]).upper()
+fault_val = structured.get("fault", scenario_meta["name"])
+comp_val = structured.get("component", scenario_meta["category"])
+explanation_val = structured.get("explanation", "")
+rec_action_val = structured.get("recommended_action", scenario_meta["action_short"])
+maint_action_val = structured.get("maintenance_action", scenario_meta["recommended_action"])
+checks_val = structured.get("additional_checks", [])
+
 source_badge = diag_response["badge"]
 model_tag = diag_response["model_used"]
-severity_badge = "badge-normal" if scenario_meta["severity"] == "NORMAL" else ("badge-critical" if scenario_meta["severity"] == "CRITICAL" else "badge-moderate")
+severity_badge = "badge-normal" if severity_val == "NORMAL" else ("badge-critical" if severity_val == "CRITICAL" else "badge-moderate")
 
+# Render Top Diagnostic Header
 st.markdown(f"""
 <div class='diagnosis-container'>
     <div style='display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;'>
         <div>
-            <span style='font-size: 1.2rem; font-weight: 700; color: #60A5FA;'>Diagnostic Intelligence Engine</span>
-            <div style='font-size: 0.8rem; color: #94A3B8;'>Model / Engine: <code>{model_tag}</code></div>
+            <span style='font-size: 1.25rem; font-weight: 800; color: #60A5FA;'>Physical AI Diagnostic Intelligence</span>
+            <div style='font-size: 0.82rem; color: #94A3B8;'>Model: <code>{model_tag}</code></div>
         </div>
         <div>
-            {source_badge} &nbsp; <span class='{severity_badge}'>SEVERITY: {scenario_meta['severity']}</span>
+            {source_badge} &nbsp; <span class='{severity_badge}'>SEVERITY: {severity_val}</span>
         </div>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-# Markdown Diagnostic Text
-st.markdown(diag_response["diagnostic_text"])
+# Render Structured JSON Cards
+d_col1, d_col2 = st.columns([1, 1])
+with d_col1:
+    st.markdown(f"""
+    <div style='background-color: #111827; border: 1px solid #1F2937; border-left: 4px solid #38BDF8; padding: 14px; border-radius: 6px; margin-bottom: 12px;'>
+        <div style='font-size: 0.78rem; color: #94A3B8; text-transform: uppercase; letter-spacing: 0.5px;'>Diagnosed Fault</div>
+        <div style='font-size: 1.15rem; font-weight: 700; color: #F8FAFC;'>{fault_val}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with d_col2:
+    st.markdown(f"""
+    <div style='background-color: #111827; border: 1px solid #1F2937; border-left: 4px solid #F59E0B; padding: 14px; border-radius: 6px; margin-bottom: 12px;'>
+        <div style='font-size: 0.78rem; color: #94A3B8; text-transform: uppercase; letter-spacing: 0.5px;'>Degraded Subsystem Component</div>
+        <div style='font-size: 1.15rem; font-weight: 700; color: #F8FAFC;'>{comp_val}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Physical Explanation Card
+st.markdown("#### 🔬 Root Cause Physical Explanation")
+st.markdown(f"""
+<div style='background-color: #0F172A; border: 1px solid #334155; padding: 16px; border-radius: 6px; font-size: 0.95rem; line-height: 1.6; color: #E2E8F0; margin-bottom: 16px;'>
+    {explanation_val}
+</div>
+""", unsafe_allow_html=True)
+
+# Two-column Action & Maintenance Cards
+card_c1, card_c2 = st.columns(2)
+with card_c1:
+    st.markdown(f"""
+    <div style='background-color: #111827; border: 1px solid #059669; padding: 14px; border-radius: 6px; height: 100%;'>
+        <div style='font-size: 0.8rem; font-weight: 700; color: #10B981; margin-bottom: 4px;'>⚡ IMMEDIATE OPERATIONAL ACTION</div>
+        <div style='font-size: 0.95rem; color: #F1F5F9;'>{rec_action_val}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with card_c2:
+    st.markdown(f"""
+    <div style='background-color: #111827; border: 1px solid #2563EB; padding: 14px; border-radius: 6px; height: 100%;'>
+        <div style='font-size: 0.8rem; font-weight: 700; color: #60A5FA; margin-bottom: 4px;'>🛠️ TECHNICIAN MAINTENANCE SOP</div>
+        <div style='font-size: 0.95rem; color: #F1F5F9;'>{maint_action_val}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Additional Checks Checklist
+if checks_val:
+    with st.expander("📋 Additional Diagnostic Verifications & Physical Checks", expanded=True):
+        for chk in checks_val:
+            st.markdown(f"- ✅ **{chk}**")
 
 # ---------------------------------------------------------
 # CLOSED-LOOP RECOMMENDED ACTION & SIMULATED MACHINE RESPONSE
@@ -669,16 +743,16 @@ st.markdown("### ⚡ Corrective Action & Machine Response Closed-Loop")
 act_col1, act_col2 = st.columns([2, 1])
 
 with act_col1:
-    st.markdown(f"**Recommended SOP Action:**")
-    st.info(f"👉 **{scenario_meta['action_short']}**: {scenario_meta['recommended_action']}")
+    st.markdown(f"**AI Recommended Corrective SOP:**")
+    st.info(f"👉 **{rec_action_val}**\n\n*Maintenance Follow-up:* {maint_action_val}")
 
 with act_col2:
     st.markdown("**Simulate Operator Intervention:**")
     apply_btn = st.button(
-        f"⚡ Apply Simulated Action: {scenario_meta['action_short']}", 
+        f"⚡ Apply Action: {rec_action_val[:45]}...", 
         type="primary", 
         use_container_width=True,
-        help="Simulates the physical transient response of the drill rig as the automated corrective action is applied."
+        help="Executes the AI-recommended operational action and simulates the drill rig physical recovery transient."
     )
 
 if apply_btn:
@@ -687,7 +761,7 @@ if apply_btn:
         trajectory = drillguard.simulate_machine_response(current_code, steps=6)
         st.session_state["action_applied"] = True
         st.session_state["recovery_trajectory"] = trajectory
-        st.session_state["last_action_name"] = scenario_meta["action_short"]
+        st.session_state["last_action_name"] = rec_action_val
         st.rerun()
 
 # If recovery trajectory exists, visualize recovery transient curves

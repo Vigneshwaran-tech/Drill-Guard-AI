@@ -20,6 +20,8 @@ Features:
 import os
 import time
 import math
+import json
+import re
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, List, Tuple
@@ -37,7 +39,18 @@ except ImportError:
 
 # Check OpenAI SDK
 try:
-    from openai import OpenAI
+    from openai import (
+        OpenAI,
+        APIError,
+        AuthenticationError,
+        PermissionDeniedError,
+        NotFoundError,
+        RateLimitError,
+        BadRequestError,
+        APITimeoutError,
+        APIConnectionError,
+        InternalServerError,
+    )
     HAS_OPENAI = True
 except ImportError:
     HAS_OPENAI = False
@@ -515,62 +528,224 @@ class DrillGuardML:
 # NEBIUS TOKEN FACTORY & NVIDIA NEMOTRON DIAGNOSTIC ENGINE
 # ---------------------------------------------------------
 
+def format_nebius_error(e: Exception, model: str, base_url: str) -> str:
+    """Format API errors safely without exposing secret credentials."""
+    if not HAS_OPENAI:
+        return f"OpenAI SDK error: {str(e)}"
+
+    if isinstance(e, AuthenticationError):
+        return (
+            "Authentication Failed (HTTP 401): The Nebius API key is invalid, revoked, or unauthorized. "
+            "Please check NEBIUS_API_KEY in .env or generate a new key in Nebius Token Factory console."
+        )
+    elif isinstance(e, PermissionDeniedError):
+        return (
+            "Permission Denied (HTTP 403): Account lacks permission to access this Nebius Token Factory resource."
+        )
+    elif isinstance(e, RateLimitError):
+        return (
+            "Quota / Billing / Rate Limit (HTTP 429): Nebius Token Factory token credit limit reached or rate limit exceeded. "
+            "Please check your Nebius project billing balance."
+        )
+    elif isinstance(e, NotFoundError):
+        return (
+            f"Model Not Found (HTTP 404): The model ID '{model}' was not found on regional endpoint '{base_url}'. "
+            "Please verify the model identifier."
+        )
+    elif isinstance(e, BadRequestError):
+        return f"Bad Request (HTTP 400): Incompatible request parameters for model '{model}': {str(e)}"
+    elif isinstance(e, (APITimeoutError, APIConnectionError)):
+        return (
+            f"Network Connection Failed / Timeout: Unable to reach Nebius regional endpoint at '{base_url}'. "
+            "Please verify internet connection and regional URL availability."
+        )
+    elif isinstance(e, InternalServerError):
+        return "Nebius Server Error (HTTP 500/503): Nebius Token Factory is experiencing internal server issues."
+    elif isinstance(e, APIError):
+        return f"Nebius API Error: {getattr(e, 'message', str(e))}"
+    else:
+        return f"Unexpected Error: {str(e)}"
+
+
+def extract_and_validate_json(text: str, fallback_entry: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """
+    Extracts structured JSON from model output and validates required schema:
+    severity, explanation, fault, component, recommended_action, maintenance_action, additional_checks.
+    Handles reasoning/thinking traces and markdown fences robustly.
+    """
+    extracted_obj = None
+
+    # 1. Try markdown fenced code block: ```json ... ``` or ``` ... ```
+    fence_matches = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    for block in reversed(fence_matches):
+        block = block.strip()
+        if block.startswith("{") and block.endswith("}"):
+            try:
+                extracted_obj = json.loads(block)
+                break
+            except Exception:
+                pass
+
+    # 2. Search for valid JSON object by finding matching braces backwards from the end of the string
+    if not extracted_obj:
+        last_brace = text.rfind("}")
+        while last_brace != -1:
+            depth = 0
+            for i in range(last_brace, -1, -1):
+                if text[i] == "}":
+                    depth += 1
+                elif text[i] == "{":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[i:last_brace + 1].strip()
+                        try:
+                            extracted_obj = json.loads(candidate)
+                            break
+                        except Exception:
+                            pass
+            if extracted_obj:
+                break
+            last_brace = text.rfind("}", 0, last_brace)
+
+    # 3. Direct parse attempt
+    if not extracted_obj:
+        try:
+            extracted_obj = json.loads(text.strip())
+        except Exception:
+            pass
+
+    # If extraction completely failed, return fallback entry with is_valid=False
+    if not isinstance(extracted_obj, dict):
+        return dict(fallback_entry), False
+
+    # Validate and normalize required fields
+    validated = {}
+
+    # 1. severity
+    raw_sev = str(extracted_obj.get("severity", fallback_entry.get("severity", "NORMAL"))).upper()
+    if raw_sev not in ["NORMAL", "MINOR", "MODERATE", "CRITICAL"]:
+        raw_sev = fallback_entry.get("severity", "NORMAL")
+    validated["severity"] = raw_sev
+
+    # 2. explanation
+    validated["explanation"] = str(extracted_obj.get("explanation") or fallback_entry.get("explanation", ""))
+
+    # 3. fault
+    validated["fault"] = str(extracted_obj.get("fault") or fallback_entry.get("fault", ""))
+
+    # 4. component
+    validated["component"] = str(extracted_obj.get("component") or fallback_entry.get("component", ""))
+
+    # 5. recommended_action
+    validated["recommended_action"] = str(extracted_obj.get("recommended_action") or fallback_entry.get("recommended_action", ""))
+
+    # 6. maintenance_action
+    validated["maintenance_action"] = str(extracted_obj.get("maintenance_action") or fallback_entry.get("maintenance_action", ""))
+
+    # 7. additional_checks
+    raw_checks = extracted_obj.get("additional_checks")
+    if isinstance(raw_checks, list):
+        validated["additional_checks"] = [str(c).strip() for c in raw_checks if str(c).strip()]
+    elif isinstance(raw_checks, str):
+        validated["additional_checks"] = [c.strip() for c in raw_checks.split(",") if c.strip()]
+    else:
+        validated["additional_checks"] = list(fallback_entry.get("additional_checks", []))
+
+    if not validated["additional_checks"]:
+        validated["additional_checks"] = list(fallback_entry.get("additional_checks", []))
+
+    return validated, True
+
+
+def format_diagnostic_markdown(structured: Dict[str, Any], is_fallback: bool = False, error_msg: str = None) -> str:
+    """Formats structured diagnostic output into clean industrial SCADA markdown report."""
+    header = ""
+    if is_fallback:
+        header = f"> ⚠️ **[LOCAL RULE-BASED FALLBACK DIAGNOSIS]** {error_msg or 'Nebius API unavailable or invalid output'}\n\n"
+
+    checks_md = "\n".join([f"- {c}" for c in structured.get("additional_checks", [])])
+
+    return f"""{header}### 1. Executive Anomaly Assessment & Severity
+**Severity Level:** **{structured['severity']}** | **Diagnosed Fault:** {structured['fault']}  
+**Degraded Component:** `{structured['component']}`
+
+### 2. Multi-Subsystem Physical Breakdown & Root Cause
+{structured['explanation']}
+
+### 3. Immediate Recommended Operational SOP
+👉 **{structured['recommended_action']}**
+
+### 4. Technician Maintenance SOP (Follow-Up)
+🛠️ **{structured['maintenance_action']}**
+
+### 5. Additional Diagnostic Verifications
+{checks_md}"""
+
+
 class NemotronDiagnosticEngine:
     """
     Communicates with NVIDIA Nemotron hosted on Nebius Token Factory API.
     Provides verifiable diagnostic reasoning with industrial engineering precision.
+    Outputs structured JSON schema:
+    severity, explanation, fault, component, recommended_action, maintenance_action, additional_checks.
     Includes robust fallback mechanism if API key is unset or service is unreachable.
     """
     def __init__(self):
         self.api_key = os.getenv("NEBIUS_API_KEY", "").strip()
-        self.base_url = os.getenv("NEBIUS_BASE_URL", "https://api.tokenfactory.nebius.com/v1/").strip()
-        self.model = os.getenv("NEBIUS_MODEL", "nvidia/Llama-3_1-Nemotron-70B-Instruct-HF").strip()
+        self.base_url = os.getenv("NEBIUS_BASE_URL", "https://api.tokenfactory.eu-north1.nebius.com/v1/").strip()
+        self.model = os.getenv("NEBIUS_MODEL", "nvidia/Nemotron-3_5-Lightning").strip()
 
     def diagnose(self, telemetry: Dict[str, float], ml_analysis: Dict[str, Any], scenario_meta: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Executes AI diagnostic reasoning.
+        Executes AI diagnostic reasoning with end-to-end structured JSON parsing.
         Returns:
-            - diagnostic_text: str (Structured analysis)
+            - structured: Dict[str, Any] (validated fields)
+            - diagnostic_text: str (Markdown report for UI)
             - source: str ("NEBIUS_NEMOTRON" or "LOCAL_FALLBACK")
             - status: str ("SUCCESS" or "FALLBACK")
             - model_used: str
-            - raw_response: optional str
+            - is_fallback: bool
+            - error_message: optional str
         """
-        # Format diagnostic prompt context
-        prompt = self._build_prompt(telemetry, ml_analysis, scenario_meta)
+        code = scenario_meta.get("code", "NORMAL")
+        pred_code = ml_analysis.get("predicted_fault_code", code)
+        fallback_entry = self._get_fallback_entry(pred_code, telemetry, ml_analysis, scenario_meta)
 
         # Check if API key is provided and valid format
         if not self.api_key or self.api_key == "your_nebius_api_key_here":
             return self._generate_local_fallback(
-                telemetry, ml_analysis, scenario_meta,
+                fallback_entry,
                 reason="Nebius Token Factory API key not configured in .env (NEBIUS_API_KEY is empty/placeholder)."
             )
 
         if not HAS_OPENAI:
             return self._generate_local_fallback(
-                telemetry, ml_analysis, scenario_meta,
+                fallback_entry,
                 reason="OpenAI Python SDK not installed in environment."
             )
+
+        # Format diagnostic prompt context
+        prompt = self._build_prompt(telemetry, ml_analysis, scenario_meta)
 
         try:
             client = OpenAI(
                 base_url=self.base_url,
                 api_key=self.api_key,
-                timeout=25.0
+                timeout=35.0
             )
 
             system_instruction = (
                 "You are the Senior Drill Rig Diagnostic Engineer & Physical AI Specialist operating DrillGuard AI. "
                 "Analyze multi-subsystem industrial drill rig telemetry across Electrical, Mechanical, and Hydraulic domains. "
-                "Provide rigorous physics-grounded root cause diagnosis, failure progression horizons, and decisive corrective SOPs. "
-                "Clearly address the physical phenomena observed in the sensor readings. "
-                "Format your answer with clear markdown headings:\n"
-                "### 1. Executive Anomaly Assessment & Severity\n"
-                "### 2. Multi-Subsystem Physical Telemetry Breakdown\n"
-                "### 3. Root Cause Physical Hypothesis\n"
-                "### 4. Component Degradation Horizon & Operational Risk\n"
-                "### 5. Recommended Corrective Action SOP\n"
-                "### 6. Predicted Machine Response Trajectory"
+                "You must return ONLY a single valid JSON object containing exactly these keys:\n"
+                "- severity: \"CRITICAL\" | \"MODERATE\" | \"MINOR\" | \"NORMAL\"\n"
+                "- explanation: detailed physics explanation of the root cause based on sensor telemetry\n"
+                "- fault: clear name of the diagnosed fault\n"
+                "- component: degraded physical component\n"
+                "- recommended_action: immediate operational action to mitigate or recover\n"
+                "- maintenance_action: technician maintenance SOP\n"
+                "- additional_checks: array of 3 specific physical checks\n"
+                "Never output text or conversation outside the JSON object. Start directly with '{' and end with '}'."
             )
 
             completion = client.chat.completions.create(
@@ -579,38 +754,72 @@ class NemotronDiagnosticEngine:
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.2,
-                max_tokens=900,
+                temperature=0.1,
+                max_tokens=1800,
             )
 
-            response_text = completion.choices[0].message.content.strip()
+            raw_response = completion.choices[0].message.content.strip()
+
+            # Parse and validate structured JSON
+            structured_data, is_valid_json = extract_and_validate_json(raw_response, fallback_entry)
+
+            if not is_valid_json:
+                return self._generate_local_fallback(
+                    fallback_entry,
+                    reason="Nemotron returned non-JSON format; applied validated structured recovery fallback."
+                )
+
+            markdown_report = format_diagnostic_markdown(structured_data, is_fallback=False)
 
             return {
                 "source": "NEBIUS_NEMOTRON",
                 "status": "SUCCESS",
-                "badge": "🟢 NVIDIA Nemotron via Nebius Token Factory",
+                "badge": f"🟢 NVIDIA Nemotron ({self.model}) via Nebius",
                 "model_used": self.model,
-                "diagnostic_text": response_text,
+                "structured": structured_data,
+                "diagnostic_text": markdown_report,
+                "raw_response": raw_response,
                 "is_fallback": False,
                 "error_message": None,
             }
 
         except Exception as e:
             # Under hackathon rules: NEVER claim an LLM call succeeded if it failed.
-            error_str = str(e)
+            formatted_err = format_nebius_error(e, self.model, self.base_url)
             return self._generate_local_fallback(
-                telemetry, ml_analysis, scenario_meta,
-                reason=f"Nebius Token Factory API request failed: {error_str}"
+                fallback_entry,
+                reason=formatted_err
             )
 
     def _build_prompt(self, telemetry: Dict[str, float], ml_analysis: Dict[str, Any], scenario_meta: Dict[str, Any]) -> str:
-        dev_str = "\n".join([
-            f"- {d['name']} ({d['feature']}): {d['value']} {d['unit']} (Nominal: {d['nominal']} {d['unit']}, Δ {d['deviation_pct']}%)"
+        """
+        Builds the prompt passing actual sensor readings, detected subsystem, predicted fault,
+        classifier probability, and evidence.
+        """
+        evidence_lines = [
+            f"  * {d['name']} ({d['feature']}): {d['value']} {d['unit']} (Nominal: {d['nominal']} {d['unit']}, Deviation: Δ{d['deviation_pct']}%)"
             for d in ml_analysis.get("top_deviating_features", [])
-        ])
+        ]
+        evidence_str = "\n".join(evidence_lines) if evidence_lines else "  * All parameters operating within normal variance"
+
+        subsystem_category = scenario_meta.get("category", "General Rig Operations")
+        predicted_fault = ml_analysis.get("predicted_fault_name", scenario_meta.get("name", "Unknown"))
+        confidence_pct = ml_analysis.get("confidence", 1.0) * 100.0
+        is_anom = ml_analysis.get("is_anomaly", False)
+        anom_score = ml_analysis.get("anomaly_score", 0.0)
 
         prompt = f"""[DRILL RIG TELEMETRY INGESTION - SIMULATED TEST BENCH]
-Subsystem Telemetry Snapshot:
+
+1. DETECTED SUBSYSTEM & FAULT CLASSIFICATION:
+- Subsystem Domain: {subsystem_category}
+- Isolation Forest Anomaly Detection: {'ANOMALY DETECTED' if is_anom else 'NOMINAL ENVELOPE'} (Severity Score: {anom_score:.3f})
+- Random Forest Predicted Fault: {predicted_fault}
+- Classifier Confidence: {confidence_pct:.1f}%
+
+2. CLASSIFICATION EVIDENCE (TOP DRIFTING FEATURES):
+{evidence_str}
+
+3. ACTUAL TELEMETRY READINGS:
 ELECTRICAL SUBSYSTEM:
 - Bus Voltage: {telemetry['voltage_v']} V (Nominal: 480 V)
 - Motor Current: {telemetry['current_a']} A (Nominal: 205 A)
@@ -621,11 +830,11 @@ ELECTRICAL SUBSYSTEM:
 
 MECHANICAL SUBSYSTEM:
 - Top-Drive Speed: {telemetry['rpm']} RPM (Nominal: 135 RPM)
-- Drill Torque: {telemetry['torque_knm']} kNm (Nominal: 21.5 kNm)
-- Vibration RMS: {telemetry['vibration_rms_mms']} mm/s (Nominal: 2.4 mm/s, ISO Critical > 7.1)
+- Drill String Torque: {telemetry['torque_knm']} kNm (Nominal: 21.5 kNm)
+- Vibration RMS: {telemetry['vibration_rms_mms']} mm/s (Nominal: 2.4 mm/s, ISO Danger > 7.1 mm/s)
 - Vibration Peak: {telemetry['vibration_peak_mms']} mm/s (Nominal: 3.8 mm/s)
-- Thrust Bearing Temp: {telemetry['bearing_temp_c']} °C (Nominal: 64 °C)
-- Gearbox Lube Temp: {telemetry['gearbox_oil_temp_c']} °C (Nominal: 68 °C)
+- Main Thrust Bearing Temp: {telemetry['bearing_temp_c']} °C (Nominal: 64 °C)
+- Gearbox Oil Temp: {telemetry['gearbox_oil_temp_c']} °C (Nominal: 68 °C)
 
 HYDRAULIC SUBSYSTEM:
 - Main Hydraulic Pressure: {telemetry['hydraulic_pressure_bar']} bar (Nominal: 200 bar)
@@ -635,144 +844,278 @@ HYDRAULIC SUBSYSTEM:
 - Pump Speed: {telemetry['pump_rpm']} RPM (Nominal: 1500 RPM)
 - Reservoir Level: {telemetry['reservoir_level_pct']} % (Nominal: 88 %)
 
-ML ENSEMBLE DIAGNOSTIC METRICS:
-- Isolation Forest Anomaly Flag: {'ANOMALOUS' if ml_analysis['is_anomaly'] else 'NOMINAL'} (Score: {ml_analysis['anomaly_score']})
-- Random Forest Fault Classification: {ml_analysis['predicted_fault_name']} (Confidence: {ml_analysis['confidence']*100:.1f}%)
-- Pre-configured Test Scenario: {scenario_meta['code']} - {scenario_meta['name']}
-- Top Physics Deviations from Nominal:
-{dev_str}
-
-Please generate an exhaustive physical AI diagnostic evaluation including root cause, subsystem interaction physics, immediate operational risk, and the exact corrective action SOP."""
+Analyze this rig telemetry and provide your diagnosis in strict JSON format:
+{{
+  "severity": "CRITICAL" | "MODERATE" | "MINOR" | "NORMAL",
+  "explanation": "Deep physical explanation of root cause based on sensor readings",
+  "fault": "{predicted_fault}",
+  "component": "Specific physical component degraded",
+  "recommended_action": "Immediate operational action to mitigate or recover",
+  "maintenance_action": "Follow-up technician maintenance SOP",
+  "additional_checks": ["Check 1", "Check 2", "Check 3"]
+}}"""
         return prompt
 
-    def _generate_local_fallback(self, telemetry: Dict[str, float], ml_analysis: Dict[str, Any], scenario_meta: Dict[str, Any], reason: str) -> Dict[str, Any]:
-        """
-        Physics-grounded deterministic rule-based diagnostic engine.
-        Clearly labelled as local fallback to guarantee transparency and compliance.
-        """
-        code = scenario_meta.get("code", "NORMAL")
-        pred_code = ml_analysis.get("predicted_fault_code", code)
-        severity = scenario_meta.get("severity", "NORMAL")
-
-        # Specific tailored physical diagnostic reasoning per fault code
+    def _get_fallback_entry(self, pred_code: str, telemetry: Dict[str, float], ml_analysis: Dict[str, Any], scenario_meta: Dict[str, Any]) -> Dict[str, Any]:
+        """Provides structured knowledge base entries with all 7 fields for each scenario."""
         kb = {
             "NORMAL": {
-                "summary": "All three subsystems (Electrical, Mechanical, Hydraulic) are operating synchronously within nominal operating tolerances. No thermal, harmonic, or pressure deviations detected.",
-                "root_cause": "Steady-state drilling operation with balanced rock-bit interaction and nominal lubrication dynamics.",
-                "subsystems": "Electrical bus voltage & power factor are stable. Mechanical vibration spectra conform to ISO 10816 Class-I permissible levels (< 2.8 mm/s). Hydraulic loop maintains healthy 200 bar pressure and differential filter loss is clean at 1.4 bar.",
-                "horizon": "Indefinite nominal runtime. Next scheduled preventative maintenance window in 250 operating hours.",
-                "action": "Maintain automated drilling program parameters. Continue background telemetry acquisition and ML envelope monitoring.",
-                "response": "Steady baseline telemetry. Zero corrective dampening required."
+                "severity": "NORMAL",
+                "fault": "Nominal Healthy Drilling Operation",
+                "component": "Integrated Subsystems (Electrical VFD, Top-Drive Swivel, Hydraulic Main Loop)",
+                "explanation": (
+                    "All three subsystems (Electrical, Mechanical, Hydraulic) are operating synchronously within nominal operating tolerances. "
+                    f"Bus voltage is steady at {telemetry['voltage_v']}V, top-drive vibration RMS is {telemetry['vibration_rms_mms']} mm/s "
+                    f"(well below the 7.1 mm/s ISO danger threshold), and hydraulic loop maintains healthy {telemetry['hydraulic_pressure_bar']} bar pressure."
+                ),
+                "recommended_action": "Maintain automated drilling program parameters and continue continuous background SCADA telemetry logging.",
+                "maintenance_action": "Perform standard 250-hour lubrication rounds and oil sample collection at the next planned bit change.",
+                "additional_checks": [
+                    "Verify MWD mud pulse telemetry carrier frequency",
+                    "Check top-drive counterbalance cylinder pressure",
+                    "Log generator bus voltage harmonic distortion"
+                ]
             },
             "E1": {
-                "summary": f"CRITICAL ELECTRICAL ANOMALY: Severe overcurrent event ({telemetry['current_a']} A vs nominal 205 A, +{(telemetry['current_a']-205)/205*100:.1f}% overload). Rapid thermal buildup in VFD inverter bridge ({telemetry['vfd_temp_c']} °C).",
-                "root_cause": "Stator field saturation or transient rotary lockup causing VFD inverter bridge to deliver near short-circuit commutating current, driving thermal stress across IGBT modules.",
-                "subsystems": "Electrical: Severe current surge and bus sag. Mechanical: High magnetic counter-torque on top-drive. Hydraulic: Passive baseline unaffected.",
-                "horizon": "Immediate risk of catastrophic IGBT thermal breakdown within 45 to 90 seconds if current clamping is not deployed.",
-                "action": "Clamp VFD inverter current ceiling to 210 A, throttle rotary torque command by 30%, and cycle auxiliary cabinet forced-air blowers to maximum duty.",
-                "response": "Phase current decays to < 215 A within 3.5 seconds; VFD heat sink temperature stabilizes and decays below 65 °C."
+                "severity": "CRITICAL",
+                "fault": "E1: Electrical Overcurrent",
+                "component": "VFD Inverter Bridge & Stator Windings",
+                "explanation": (
+                    f"Severe stator phase overcurrent surge ({telemetry['current_a']} A vs nominal 205 A, +{(telemetry['current_a']-205)/205*100:.1f}% overload) "
+                    f"causing rapid thermal escalation across VFD IGBT junction modules ({telemetry['vfd_temp_c']} °C). Immediate risk of IGBT thermal breakdown."
+                ),
+                "recommended_action": "Clamp VFD inverter current ceiling to 210A, throttle drill rotary torque by 30%, and cycle auxiliary cabinet forced-air blowers to maximum.",
+                "maintenance_action": "Conduct megohmmeter insulation resistance test on top-drive motor phases and inspect VFD IGBT cooling fin airflow.",
+                "additional_checks": [
+                    "Measure phase current balance across U, V, W terminals",
+                    "Check VFD DC bus ripple voltage",
+                    "Inspect cabinet ventilation filters for blockage"
+                ]
             },
             "E2": {
-                "summary": f"MODERATE ELECTRICAL INSTABILITY: Generator bus voltage fluctuating violently ({telemetry['voltage_v']} V vs nominal 480 V) with frequency hunting ({telemetry['frequency_hz']} Hz) and degraded power factor ({telemetry['power_factor']}).",
-                "root_cause": "Rig auxiliary generator automatic voltage regulator (AVR) governor oscillation and reactive power load imbalance across SCR drives.",
-                "subsystems": "Electrical: Large voltage ripple and low displacement factor. Mechanical: Minor torsional speed ripple induced by fluctuating electromagnetic torque.",
-                "horizon": "Electronic control card trips or motor insulation dielectric fatigue within 2 to 4 hours of unmitigated harmonic cycling.",
-                "action": "Switch rig bus transformer tap changer to automated regulation mode, engage dynamic line reactors, and trim AVR governor damping gain.",
-                "response": "3-phase bus voltage stabilizes within ±1.5% of 480 V; line frequency stabilizes at 60.0 ± 0.08 Hz."
+                "severity": "MODERATE",
+                "fault": "E2: Voltage Instability & Bus Hunting",
+                "component": "Rig Generator AVR & Transformer Tap Changer",
+                "explanation": (
+                    f"Generator 3-phase bus voltage fluctuating erratically ({telemetry['voltage_v']} V vs nominal 480 V) "
+                    f"with frequency hunting ({telemetry['frequency_hz']} Hz) and degraded power factor ({telemetry['power_factor']}), induced by AVR governor hunting."
+                ),
+                "recommended_action": "Switch rig bus transformer tap changer to automated regulation mode and engage active dynamic line reactors.",
+                "maintenance_action": "Calibrate generator Automatic Voltage Regulator (AVR) governor damping gains and service bus synchronizer contacts.",
+                "additional_checks": [
+                    "Inspect generator exciter diode bridge",
+                    "Check SCR drive harmonic filters",
+                    "Verify load sharing across online diesel generator sets"
+                ]
             },
             "E3": {
-                "summary": f"CRITICAL ELECTRICAL / MOTOR FAULT: Top-drive motor stator winding asymmetry and excessive rotor slip (RPM dropped to {telemetry['rpm']} RPM with severe {telemetry['vfd_temp_c']} °C thermal rise).",
-                "root_cause": "Inter-turn insulation breakdown in Stator Phase-B winding or VFD inverter PWM gate driver desynchronization, generating intense negative-sequence braking torque.",
-                "subsystems": "Electrical: Inefficient electrical-to-mechanical conversion. Mechanical: Substantial rotary speed loss despite high electrical input power. Hydraulic: Normal.",
-                "horizon": "Complete stator phase burnout within 15 to 30 minutes of continuous high-load drilling.",
-                "action": "Derate motor duty cycle by 40%, re-zero vector encoder offset, rebalance PWM carrier frequency, and plan immediate thermographic motor inspection.",
-                "response": "Rotor slip returns to < 2.5%; winding phase currents balance within 3% tolerance and stator temperatures normalize."
+                "severity": "CRITICAL",
+                "fault": "E3: Motor Abnormality / Slip Surge",
+                "component": "Induction Motor Stator Windings & Vector Encoder",
+                "explanation": (
+                    f"Top-drive motor stator winding asymmetry and excessive rotor slip (RPM dropped to {telemetry['rpm']} RPM with severe {telemetry['vfd_temp_c']} °C thermal rise) "
+                    "indicating inter-turn insulation degradation or encoder desynchronization producing negative-sequence braking torque."
+                ),
+                "recommended_action": "Derate motor duty cycle by 40%, re-zero vector encoder pulse offset, and rebalance PWM carrier frequency.",
+                "maintenance_action": "Perform motor surge testing, thermographic stator scan, and replace rotary pulse encoder coupling.",
+                "additional_checks": [
+                    "Check optical encoder pulse alignment",
+                    "Perform motor winding resistance bridge test",
+                    "Verify resolver cable shielding against EMI noise"
+                ]
             },
             "M1": {
-                "summary": f"CRITICAL MECHANICAL VIBRATION: Severe drill string whirl and stick-slip resonance. Vibration RMS at {telemetry['vibration_rms_mms']} mm/s (ISO Class IV Danger > 7.1 mm/s) with peak spikes to {telemetry['vibration_peak_mms']} mm/s.",
-                "root_cause": "BHA (Bottom Hole Assembly) lateral resonance coupled with dynamic bit-rock friction stick-slip, inducing high torsional deceleration shockwaves up the drill stem.",
-                "subsystems": "Mechanical: Catastrophic cyclic fatigue loading on top-drive quill and swivel stem. Electrical: Torque chatter reflected into motor current ripple.",
-                "horizon": "Downhole tool joint twist-off or top-drive swivel bearing destruction within 20 to 60 minutes.",
-                "action": "Activate automated Soft-Torque rotary feedback control, reduce Weight-On-Bit (WOB) by 25%, and elevate rotary speed by 15 RPM to break lateral resonance.",
-                "response": "Vibration RMS attenuates from >18 mm/s down to < 3.2 mm/s in under 6 seconds; smooth bit rotation restored."
+                "severity": "CRITICAL",
+                "fault": "M1: Severe Drill-String Whirl & Stick-Slip Resonance",
+                "component": "Bottom-Hole Assembly (BHA) & Top-Drive Quill",
+                "explanation": (
+                    f"Extreme drill string lateral whirl and torsional stick-slip oscillation. Vibration RMS spiked to {telemetry['vibration_rms_mms']} mm/s "
+                    f"(ISO Class IV Danger > 7.1 mm/s) with peak shock impacts of {telemetry['vibration_peak_mms']} mm/s, threatening downhole tool joint twist-off."
+                ),
+                "recommended_action": "Activate Soft-Torque rotary feedback control, reduce Weight-On-Bit (WOB) by 25%, and elevate rotary speed by 15 RPM to break resonance.",
+                "maintenance_action": "Inspect drill collar tool joints and shock subs for micro-fractures, and gauge stabilizer blade wear.",
+                "additional_checks": [
+                    "Download MWD downhole accelerometer memory logs",
+                    "Perform ultrasonic NDT on top-drive quill stem",
+                    "Verify rotary table torque sensor calibration"
+                ]
             },
             "M2": {
-                "summary": f"MODERATE MECHANICAL FAULT: Top-drive main thrust bearing degradation. Bearing temperature elevated to {telemetry['bearing_temp_c']} °C with sharp crest factor shock impacts ({telemetry['vibration_peak_mms'] / (telemetry['vibration_rms_mms'] + 1e-4):.2f}).",
-                "root_cause": "Inner raceway micro-spalling and rolling element surface fatigue caused by axial shock loads during high-impact reaming operations.",
-                "subsystems": "Mechanical: Localized heat accumulation in thrust bearing housing with acoustic ultrasonic shock pulses. Electrical: Modest frictional drag increase.",
-                "horizon": "Accelerated spall propagation leading to complete bearing seizure in approximately 12 to 24 operating hours.",
-                "action": "Trigger automated high-pressure synthetic grease purging cycle, cap maximum top-drive RPM to 110, and monitor high-frequency vibration envelope.",
-                "response": "Lubrication hydrodynamics re-established; bearing temperature plateaus and stabilizes below 72 °C with dampened shock peaks."
+                "severity": "MODERATE",
+                "fault": "M2: Bearing Degradation",
+                "component": "Top-Drive Main Thrust Spherical Roller Bearing",
+                "explanation": (
+                    f"Thrust bearing temperature elevated to {telemetry['bearing_temp_c']} °C with sharp crest factor shock impacts "
+                    f"({telemetry['vibration_peak_mms'] / (telemetry['vibration_rms_mms'] + 1e-4):.2f}) indicating raceway micro-spalling and rolling element fatigue."
+                ),
+                "recommended_action": "Trigger automated high-pressure synthetic grease purging cycle and cap maximum top-drive RPM to 110.",
+                "maintenance_action": "Draw bearing lubricant grease sample for ferrographic iron particulate analysis and schedule bearing changeout.",
+                "additional_checks": [
+                    "Perform ultrasonic high-frequency shock pulse measurement (SPM)",
+                    "Inspect bearing seal lip for leakage",
+                    "Check axial play with dial indicator"
+                ]
             },
             "M3": {
-                "summary": f"MODERATE MECHANICAL FAULT: Top-drive planetary gearbox overheating ({telemetry['gearbox_oil_temp_c']} °C) with gear mesh acoustic chatter and mechanical efficiency reduction.",
-                "root_cause": "Viscosity breakdown of synthetic gear lubricant combined with localized tooth flank pitting on sun/planet gear contact faces.",
-                "subsystems": "Mechanical: Excessive boundary friction in gearbox casing generating accelerated thermal load. Hydraulic/Electrical: Secondary lube cooling circuit strained.",
-                "horizon": "Gear tooth spalling or planetary carrier seizure within 8 to 16 hours of continuous full-torque drilling.",
-                "action": "Engage auxiliary lube cooling radiator, circulate secondary offline micro-filtration loop, and limit drill torque slew rate to 2.0 kNm/sec.",
-                "response": "Lube oil temperature stabilizes and gradually declines back to 68 °C; gear mesh vibration amplitudes diminish by 45%."
+                "severity": "MODERATE",
+                "fault": "M3: Planetary Gearbox Overheating",
+                "component": "Top-Drive Planetary Gear Reducer",
+                "explanation": (
+                    f"Gearbox oil temperature elevated to {telemetry['gearbox_oil_temp_c']} °C with gear mesh chatter "
+                    "indicating accelerated boundary friction, localized tooth flank pitting, and lubricant viscosity breakdown."
+                ),
+                "recommended_action": "Engage auxiliary lube cooling radiator, circulate secondary offline micro-filtration loop, and limit drill torque slew rate to 2.0 kNm/sec.",
+                "maintenance_action": "Drain and replace ISO VG 320 synthetic gear lubricant and inspect magnetic drain plugs for metallic debris.",
+                "additional_checks": [
+                    "Borescope inspection of sun and planet gear tooth flanks",
+                    "Test oil viscosity and acid number (TAN)",
+                    "Verify lube circulating pump pressure"
+                ]
             },
             "H1": {
-                "summary": f"MODERATE HYDRAULIC FAULT: Main pump volumetric degradation. Pressure decayed to {telemetry['hydraulic_pressure_bar']} bar and flow collapsed to {telemetry['flow_rate_lpm']} L/min despite nominal pump speed ({telemetry['pump_rpm']} RPM).",
-                "root_cause": "Axial piston slipper wear and excessive internal clearance leakage across the swashplate valve plate, discharging pressurized fluid directly back to case drain.",
-                "subsystems": "Hydraulic: Severe loss of volumetric efficiency with high fluid friction heating ({telemetry['fluid_temp_c']} °C). Mechanical/Electrical: Unaffected.",
-                "horizon": "Total hydraulic actuator stall or complete top-drive pipe handler clamp failure within 2 to 6 hours.",
-                "action": "Transfer hydraulic circuit load to redundant standby Pump-B, unload primary pump swashplate angle, and tag primary pump for bench overhaul.",
-                "response": "Circuit pressure recovers immediately to 200 bar and flow rate restores to 380 L/min via Pump-B."
+                "severity": "MODERATE",
+                "fault": "H1: Hydraulic Pump Volumetric Degradation",
+                "component": "Primary Axial Piston Swashplate Pump",
+                "explanation": (
+                    f"Main hydraulic pressure decayed to {telemetry['hydraulic_pressure_bar']} bar and flow collapsed to {telemetry['flow_rate_lpm']} L/min "
+                    f"despite nominal pump speed ({telemetry['pump_rpm']} RPM) caused by internal swashplate leakage discharging fluid back to case drain."
+                ),
+                "recommended_action": "Transfer hydraulic circuit load to redundant standby Pump-B and unload primary pump swashplate angle.",
+                "maintenance_action": "Remove primary pump for bench tear-down, replace worn bronze slipper pads and lapped valve plate.",
+                "additional_checks": [
+                    "Measure pump case drain leakage flow rate",
+                    "Check suction strainer for particulate ingress",
+                    "Inspect proportional displacement control valve"
+                ]
             },
             "H2": {
-                "summary": f"MODERATE HYDRAULIC ANOMALY: Severe differential pressure surge across return-line micron filter ({telemetry['differential_pressure_bar']} bar vs nominal 1.4 bar, +{(telemetry['differential_pressure_bar']-1.4)/1.4*100:.0f}% increase).",
-                "root_cause": "Heavy particulate contamination and filter media blinding, restricting fluid return circulation and approaching internal bypass valve opening limit (5.0 bar).",
-                "subsystems": "Hydraulic: Dangerous backpressure on return manifold ({telemetry['hydraulic_pressure_bar']} bar) creating risk of pump suction cavitation and seal extrusion.",
-                "horizon": "Filter bypass valve will burst open within 15 to 45 minutes, circulating unfiltered abrasive particulates into sensitive proportional servo valves.",
-                "action": "Rotate manual duplex filter selector valve to online clean standby cartridge and initiate automatic ultrasonic backflush cycle.",
-                "response": "Differential pressure across filter element plummets from >7.5 bar to 1.3 bar in under 2 seconds; return line backpressure normalizes."
+                "severity": "MODERATE",
+                "fault": "H2: Return Line Filter Blockage",
+                "component": "Dual Duplex Return Micron Filter Element",
+                "explanation": (
+                    f"Severe differential pressure surge across return-line filter ({telemetry['differential_pressure_bar']} bar vs nominal 1.4 bar, "
+                    f"approaching the 5.0 bar bypass limit) with elevated upstream backpressure ({telemetry['hydraulic_pressure_bar']} bar) creating cavitation risk."
+                ),
+                "recommended_action": "Rotate duplex filter selector valve to online clean standby cartridge and initiate automatic backflush sequence.",
+                "maintenance_action": "Replace blinded 10-micron glass fiber filter element and perform patch test on hydraulic fluid contamination (ISO 4406).",
+                "additional_checks": [
+                    "Verify differential pressure visual indicator pop-up",
+                    "Inspect bypass valve spring tension",
+                    "Test return manifold check valves"
+                ]
             },
             "H3": {
-                "summary": f"CRITICAL HYDRAULIC COLLAPSE: Catastrophic hydraulic pressure loss ({telemetry['hydraulic_pressure_bar']} bar vs nominal 200 bar) accompanied by reservoir depletion ({telemetry['reservoir_level_pct']} %).",
-                "root_cause": "Major high-pressure manifold flange seal failure or stuck-open main relief valve dumping fluid directly into tank or external containment.",
-                "subsystems": "Hydraulic: Complete loss of hydraulic actuation power for top-drive counter-balance, drill elevators, and iron roughneck clamping jaws.",
-                "horizon": "Immediate safety hazard. Equipment slippage or dropped drill-string risk within seconds if counter-balance check valves fail.",
-                "action": "Isolate high-pressure supply manifold, engage safety accumulator emergency hold, and trip rig hydraulic safety stop.",
-                "response": "Accumulator locks load safety circuits at 185 bar holding pressure; fluid loss halts and emergency containment secured."
+                "severity": "CRITICAL",
+                "fault": "H3: Severe Hydraulic Pressure Collapse",
+                "component": "High-Pressure Distribution Manifold & Bladder Accumulator",
+                "explanation": (
+                    f"Catastrophic hydraulic pressure collapse down to {telemetry['hydraulic_pressure_bar']} bar with reservoir fluid loss "
+                    f"down to {telemetry['reservoir_level_pct']} % indicating high-pressure manifold breach or blown relief seal."
+                ),
+                "recommended_action": "Isolate high-pressure supply manifold, engage safety accumulator emergency hold, and trip rig hydraulic safety stop.",
+                "maintenance_action": "Inspect high-pressure flexible hoses for burst, replace manifold O-rings, and pressure-test circuit with inert nitrogen.",
+                "additional_checks": [
+                    "Check fluid containment sump for environmental spill",
+                    "Verify accumulator pre-charge nitrogen pressure",
+                    "Inspect counterbalance cylinder check valves"
+                ]
             },
         }
+        return kb.get(pred_code, kb["NORMAL"])
 
-        entry = kb.get(pred_code, kb["NORMAL"])
-
-        fallback_text = f"""[LOCAL RULE-BASED FALLBACK DIAGNOSIS - Nebius Token Factory API unavailable or no API key configured]
-
-### 1. Executive Anomaly Assessment & Severity
-**Classification:** {SCENARIOS.get(pred_code, {}).get('name', pred_code)}
-**Severity Level:** **{severity}** | **Isolation Forest Anomaly Score:** {ml_analysis.get('anomaly_score', 0.0)}
-**Summary:** {entry['summary']}
-
-### 2. Multi-Subsystem Physical Telemetry Breakdown
-{entry['subsystems']}
-
-### 3. Root Cause Physical Hypothesis
-{entry['root_cause']}
-
-### 4. Component Degradation Horizon & Operational Risk
-**Estimated Failure Window:** {entry['horizon']}
-
-### 5. Recommended Corrective Action SOP
-**Action:** {entry['action']}
-
-### 6. Predicted Machine Response Trajectory
-{entry['response']}
-
----
-*Notice: This diagnostic report was generated by DrillGuard AI's embedded physical physics engine as a reliable local fallback because {reason}.*"""
+    def _generate_local_fallback(self, fallback_entry: Dict[str, Any], reason: str) -> Dict[str, Any]:
+        """Physics-grounded deterministic rule-based diagnostic fallback."""
+        markdown_report = format_diagnostic_markdown(fallback_entry, is_fallback=True, error_msg=reason)
 
         return {
             "source": "LOCAL_FALLBACK",
             "status": "FALLBACK",
             "badge": "🟠 Local Rule-Based Fallback Engine",
             "model_used": "Embedded Physical Knowledge Base (Local Rule Engine)",
-            "diagnostic_text": fallback_text,
+            "structured": fallback_entry,
+            "diagnostic_text": markdown_report,
+            "raw_response": None,
             "is_fallback": True,
             "error_message": reason,
+        }
+
+
+def test_nemotron_connection(diagnostic_question: str = None) -> Dict[str, Any]:
+    """
+    Sends a test physical diagnostic query to NVIDIA Nemotron on Nebius Token Factory.
+    Safely reads credentials from .env, validates the connection, and measures latency.
+    Never exposes secret API keys.
+    """
+    if not HAS_OPENAI:
+        return {
+            "success": False,
+            "error": "OpenAI Python SDK is not installed in the current environment.",
+            "source": "SDK_ERROR",
+            "model": None,
+            "base_url": None,
+            "question": diagnostic_question,
+            "response": None,
+            "latency_sec": 0.0,
+        }
+
+    api_key = os.getenv("NEBIUS_API_KEY", "").strip()
+    base_url = os.getenv("NEBIUS_BASE_URL", "https://api.tokenfactory.eu-north1.nebius.com/v1/").strip()
+    model = os.getenv("NEBIUS_MODEL", "nvidia/Nemotron-3_5-Lightning").strip()
+
+    if not api_key or api_key == "your_nebius_api_key_here":
+        return {
+            "success": False,
+            "error": "NEBIUS_API_KEY is missing or still set to placeholder in .env.",
+            "source": "CONFIG_ERROR",
+            "model": model,
+            "base_url": base_url,
+            "question": diagnostic_question,
+            "response": None,
+            "latency_sec": 0.0,
+        }
+
+    question = diagnostic_question or (
+        "Rig telemetry test: Top-drive vibration RMS reached 19.2 mm/s with stick-slip chatter. "
+        "Provide immediate physical diagnosis and primary mitigation in 2 concise sentences."
+    )
+
+    t0 = time.time()
+    try:
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=25.0)
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a Senior Drill Rig Diagnostic Engineer & Physical AI Specialist."},
+                {"role": "user", "content": question}
+            ],
+            temperature=0.2,
+            max_tokens=500,
+        )
+        latency = round(time.time() - t0, 2)
+        response_text = completion.choices[0].message.content.strip()
+
+        return {
+            "success": True,
+            "error": None,
+            "source": "NEBIUS_NEMOTRON",
+            "model": model,
+            "base_url": base_url,
+            "question": question,
+            "response": response_text,
+            "latency_sec": latency,
+        }
+    except Exception as e:
+        latency = round(time.time() - t0, 2)
+        err_msg = format_nebius_error(e, model, base_url)
+        return {
+            "success": False,
+            "error": err_msg,
+            "source": "API_ERROR",
+            "model": model,
+            "base_url": base_url,
+            "question": question,
+            "response": None,
+            "latency_sec": latency,
         }
 
 
