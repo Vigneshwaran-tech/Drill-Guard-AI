@@ -731,7 +731,7 @@ class NemotronDiagnosticEngine:
             client = OpenAI(
                 base_url=self.base_url,
                 api_key=self.api_key,
-                timeout=35.0
+                timeout=75.0
             )
 
             system_instruction = (
@@ -1082,15 +1082,15 @@ def test_nemotron_connection(diagnostic_question: str = None) -> Dict[str, Any]:
 
     t0 = time.time()
     try:
-        client = OpenAI(base_url=base_url, api_key=api_key, timeout=25.0)
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=75.0)
         completion = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are a Senior Drill Rig Diagnostic Engineer & Physical AI Specialist."},
+                {"role": "system", "content": "You are a Senior Drill Rig Diagnostic Engineer & Physical AI Specialist. Provide direct, concise physical diagnostic recommendations without preamble."},
                 {"role": "user", "content": question}
             ],
             temperature=0.2,
-            max_tokens=500,
+            max_tokens=600,
         )
         latency = round(time.time() - t0, 2)
         response_text = completion.choices[0].message.content.strip()
