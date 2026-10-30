@@ -112,8 +112,8 @@ Open `.env` and configure your Nebius Token Factory credentials:
 
 ```ini
 NEBIUS_API_KEY=your_nebius_api_key_here
-NEBIUS_BASE_URL=https://api.studio.nebius.ai/v1
-NEBIUS_MODEL=nvidia/Llama-3_1-Nemotron-70B-Instruct-HF
+NEBIUS_BASE_URL=https://api.tokenfactory.eu-north1.nebius.com/v1/
+NEBIUS_MODEL=nvidia/Nemotron-3_5-Lightning
 ```
 
 > **Note**: If `NEBIUS_API_KEY` is not provided, DrillGuard AI operates in **Local Physical Fallback Mode**, providing physics-grounded diagnostic reasoning while clearly indicating the fallback status in the UI.
