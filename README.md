@@ -76,7 +76,8 @@ Scikit-Learn Isolation Forest  Scikit-Learn Random Forest
   - `sklearn.ensemble.RandomForestClassifier` (100-tree ensemble for 10-class fault classification)
 - **Visual Analytics**: Plotly Dark Interactive SCADA telemetry waveforms, gauges, and recovery trends
 - **GenAI Reasoning**: OpenAI Python SDK connecting to **Nebius Token Factory API**
-- **LLM Diagnostic Model**: **NVIDIA Nemotron** (`nvidia/Llama-3_1-Nemotron-70B-Instruct-HF` or `nvidia/nemotron-4-340b-instruct`)
+- **LLM Diagnostic Model**: **NVIDIA Nemotron 3.5 Lightning** (`nvidia/Nemotron-3_5-Lightning`) via Nebius Token Factory OpenAI-compatible API
+- **Alternative Supported Models**: `nvidia/nemotron-3-super-120b-a12b`, `nvidia/Nemotron-3-Ultra-550b-a55b`, `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`, `nvidia/Llama-3_1-Nemotron-70B-Instruct-HF`
 - **Robustness**: Automated local physical rule-based fallback when API key is missing or offline (always transparently labelled)
 
 ---
