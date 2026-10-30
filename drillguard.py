@@ -737,7 +737,8 @@ class NemotronDiagnosticEngine:
             system_instruction = (
                 "You are the Senior Drill Rig Diagnostic Engineer & Physical AI Specialist operating DrillGuard AI. "
                 "Analyze multi-subsystem industrial drill rig telemetry across Electrical, Mechanical, and Hydraulic domains. "
-                "You must return ONLY a single valid JSON object containing exactly these keys:\n"
+                "Return ONLY a single valid JSON object. Do not output any thinking process, preamble, or conversational text outside the JSON. "
+                "The JSON must contain exactly these 7 keys:\n"
                 "- severity: \"CRITICAL\" | \"MODERATE\" | \"MINOR\" | \"NORMAL\"\n"
                 "- explanation: detailed physics explanation of the root cause based on sensor telemetry\n"
                 "- fault: clear name of the diagnosed fault\n"
@@ -745,7 +746,7 @@ class NemotronDiagnosticEngine:
                 "- recommended_action: immediate operational action to mitigate or recover\n"
                 "- maintenance_action: technician maintenance SOP\n"
                 "- additional_checks: array of 3 specific physical checks\n"
-                "Never output text or conversation outside the JSON object. Start directly with '{' and end with '}'."
+                "Start directly with '{' and end with '}'."
             )
 
             completion = client.chat.completions.create(
@@ -755,7 +756,7 @@ class NemotronDiagnosticEngine:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
-                max_tokens=1800,
+                max_tokens=2500,
             )
 
             raw_response = completion.choices[0].message.content.strip()
@@ -797,7 +798,7 @@ class NemotronDiagnosticEngine:
         classifier probability, and evidence.
         """
         evidence_lines = [
-            f"  * {d['name']} ({d['feature']}): {d['value']} {d['unit']} (Nominal: {d['nominal']} {d['unit']}, Deviation: Δ{d['deviation_pct']}%)"
+            f"  * {d['name']} ({d['feature']}): {d['value']} {d['unit']} (Nominal: {d['nominal']} {d['unit']}, Deviation: Delta {d['deviation_pct']}%)"
             for d in ml_analysis.get("top_deviating_features", [])
         ]
         evidence_str = "\n".join(evidence_lines) if evidence_lines else "  * All parameters operating within normal variance"
