@@ -40,3 +40,4 @@ Thumbs.db
 *.webp
 *.mp4
 *.pdf
+generate_documentation_pdf.py
