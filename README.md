@@ -87,14 +87,16 @@ Scikit-Learn Isolation Forest  Scikit-Learn Random Forest
 ### 1. Clone & Set Up Environment
 
 ```bash
-git clone <repo-url>
-cd "Drill Guard AI"
+git clone https://github.com/Vigneshwaran-tech/Drill-Guard-AI.git
+cd Drill-Guard-AI
 
-# Create and activate virtual environment (optional)
+# Create virtual environment (optional)
 python -m venv .venv
-# Windows:
+
+# Windows (Command Prompt / PowerShell):
 .venv\Scripts\activate
-# Linux/macOS:
+
+# Linux / macOS:
 source .venv/bin/activate
 
 # Install dependencies
@@ -106,6 +108,10 @@ pip install -r requirements.txt
 Copy `.env.example` to `.env`:
 
 ```bash
+# Windows (cmd):
+copy .env.example .env
+
+# Windows (PowerShell) / Linux / macOS:
 cp .env.example .env
 ```
 
