@@ -39,3 +39,4 @@ models/*.joblib
 Thumbs.db
 *.webp
 *.mp4
+*.pdf
